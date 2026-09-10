@@ -27,6 +27,7 @@ function setFile(file){
   if(!file)return;
   const ok=/\.(xlsx|csv)$/i.test(file.name);
   if(!ok){alert("Please select an XLSX or CSV file.");return}
+  if(file.size>500*1024*1024){alert("File is too large. Maximum upload size is 500 MB.");return}
   selectedFile=file;
   fileTitle.textContent=file.name;
   fileSub.textContent=(file.size/1024/1024).toFixed(2)+" MB";
@@ -50,7 +51,9 @@ startBtn.addEventListener("click",async()=>{
   fd.append("smtp",document.getElementById("smtpCheck").checked?"true":"false");
   try{
     const r=await fetch("/api/verify",{method:"POST",body:fd});
-    const data=await r.json();
+    let data={};
+    try{data=await r.json();}catch{}
+    if(r.status===413)throw new Error(data.error||"File is too large. Maximum upload size is 500 MB.");
     if(!r.ok)throw new Error(data.error||"Upload failed");
     jobId=data.job_id;
     totalEl.textContent=data.total.toLocaleString();

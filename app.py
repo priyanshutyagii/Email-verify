@@ -1,22 +1,43 @@
 import csv
 import io
+import os
 import re
 import smtplib
 import socket
+import tempfile
 import threading
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time as dt_time
 
-from flask import Flask, jsonify, request, send_from_directory, send_file
+from flask import Flask, Request, jsonify, request, send_from_directory, send_file
 from openpyxl import load_workbook, Workbook
+from werkzeug.exceptions import RequestEntityTooLarge
 import dns.resolver
 
+MAX_UPLOAD_MB = 500
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+class LargeUploadRequest(Request):
+    # Flask 3.1 / Werkzeug applies this to the whole multipart body, including files.
+    # None disables the in-memory cap so large XLSX/CSV uploads can stream to disk.
+    max_form_memory_size = None
+    max_content_length = MAX_UPLOAD_BYTES
+
+
 app = Flask(__name__, static_folder="static")
+app.request_class = LargeUploadRequest
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+app.config["MAX_FORM_MEMORY_SIZE"] = None
+app.config["MAX_FORM_PARTS"] = 10_000
 
 jobs = {}
 jobs_lock = threading.Lock()
 email_re = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "mailverify_jobs")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Keep this list conservative. Add company-approved disposable domains as needed.
 DISPOSABLE_DOMAINS = {
@@ -24,6 +45,14 @@ DISPOSABLE_DOMAINS = {
     "temp-mail.org", "tempmail.com", "yopmail.com", "getnada.com",
     "trashmail.com", "sharklasers.com"
 }
+
+
+@app.errorhandler(413)
+@app.errorhandler(RequestEntityTooLarge)
+def too_large(_e):
+    return jsonify({
+        "error": f"File is too large. Maximum upload size is {MAX_UPLOAD_MB} MB."
+    }), 413
 
 
 def normalize_email(value):
@@ -138,7 +167,7 @@ def process_job(job_id, emails, do_smtp):
                 job = jobs[job_id]
                 job["done"] += 1
                 job["counts"][status] = job["counts"].get(status, 0) + 1
-                job["results"].append(row)
+                job["recent"].append(row)
                 job["ordered"] = ordered
 
     with jobs_lock:
@@ -185,6 +214,41 @@ def find_email_column(headers):
     return None
 
 
+def parse_emails_from_path(path, file_ext):
+    emails = []
+    if file_ext == "xlsx":
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            rows = ws.iter_rows(values_only=True)
+            first = next(rows, None)
+            if first is None:
+                return None, None, "Excel file is empty"
+            headers = [str(x).strip() if x is not None else "" for x in first]
+            email_idx = find_email_column(headers)
+            if email_idx is None:
+                return None, None, "Email column not found. Add a column named Email."
+            for row in rows:
+                row = row or []
+                emails.append(normalize_email(row[email_idx] if email_idx < len(row) else ""))
+        finally:
+            wb.close()
+        return headers, emails, None
+
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+        reader = csv.reader(fh)
+        first = next(reader, None)
+        if first is None:
+            return None, None, "CSV file is empty"
+        headers = [str(x).strip() if x is not None else "" for x in first]
+        email_idx = find_email_column(headers)
+        if email_idx is None:
+            return None, None, "Email column not found. Add a column named Email."
+        for row in reader:
+            emails.append(normalize_email(row[email_idx] if email_idx < len(row) else ""))
+    return headers, emails, None
+
+
 @app.get("/")
 def index():
     return send_from_directory("static", "index.html")
@@ -199,54 +263,47 @@ def start_verify():
     do_smtp = request.form.get("smtp", "true").lower() == "true"
     filename = (uploaded.filename or "").lower()
 
+    if filename.endswith(".xlsx"):
+        file_ext = "xlsx"
+    elif filename.endswith(".csv"):
+        file_ext = "csv"
+    else:
+        return jsonify({"error": "Only XLSX and CSV files are supported"}), 400
+
+    job_id = uuid.uuid4().hex
+    source_path = os.path.join(UPLOAD_DIR, f"{job_id}.{file_ext}")
+
     try:
-        data = uploaded.read()
-        if filename.endswith(".xlsx"):
-            wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
-            ws = wb.active
-            rows = list(ws.iter_rows(values_only=True))
-            wb.close()
-            if not rows:
-                return jsonify({"error": "Excel file is empty"}), 400
-            headers = [str(x).strip() if x is not None else "" for x in rows[0]]
-            email_idx = find_email_column(headers)
-            if email_idx is None:
-                return jsonify({"error": "Email column not found. Add a column named Email."}), 400
-            source_rows = [copy_row(r) for r in rows[1:]]
-            emails = [normalize_email(r[email_idx] if email_idx < len(r) else "") for r in source_rows]
-            file_ext = "xlsx"
-        elif filename.endswith(".csv"):
-            text = data.decode("utf-8-sig", errors="replace")
-            reader = csv.reader(io.StringIO(text))
-            rows = list(reader)
-            if not rows:
-                return jsonify({"error": "CSV file is empty"}), 400
-            headers = [str(x).strip() if x is not None else "" for x in rows[0]]
-            email_idx = find_email_column(headers)
-            if email_idx is None:
-                return jsonify({"error": "Email column not found. Add a column named Email."}), 400
-            source_rows = [copy_row(r) for r in rows[1:]]
-            emails = [normalize_email(r[email_idx] if email_idx < len(r) else "") for r in source_rows]
-            file_ext = "csv"
-        else:
-            return jsonify({"error": "Only XLSX and CSV files are supported"}), 400
+        uploaded.save(source_path)
+        size = os.path.getsize(source_path)
+        if size > MAX_UPLOAD_BYTES:
+            os.remove(source_path)
+            return jsonify({
+                "error": f"File is too large. Maximum upload size is {MAX_UPLOAD_MB} MB."
+            }), 413
+        headers, emails, err = parse_emails_from_path(source_path, file_ext)
+        if err:
+            os.remove(source_path)
+            return jsonify({"error": err}), 400
     except Exception as e:
+        if os.path.exists(source_path):
+            os.remove(source_path)
         return jsonify({"error": f"Could not read file: {e}"}), 400
 
     if not emails:
+        os.remove(source_path)
         return jsonify({"error": "No email rows found in the file"}), 400
 
-    job_id = uuid.uuid4().hex
     with jobs_lock:
         jobs[job_id] = {
             "status": "queued",
             "total": len(emails),
             "done": 0,
-            "results": [],
+            "recent": deque(maxlen=150),
             "ordered": [],
             "counts": {"VALID": 0, "INVALID": 0, "RISKY": 0, "UNKNOWN": 0},
             "headers": headers,
-            "source_rows": source_rows,
+            "source_path": source_path,
             "file_ext": file_ext,
         }
     threading.Thread(target=process_job, args=(job_id, emails, do_smtp), daemon=True).start()
@@ -260,28 +317,14 @@ def status(job_id):
         job = jobs.get(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
-        # Only return finished rows (never null placeholders).
-        completed = [r for r in job["results"] if r]
         payload = {
             "status": job["status"],
             "total": job["total"],
             "done": job["done"],
             "counts": dict(job["counts"]),
-            "results": completed[-150:],
+            "results": list(job["recent"]),
         }
     return jsonify(payload)
-
-
-def aligned_rows(headers, data_rows):
-    col_count = len(headers)
-    for row in data_rows:
-        col_count = max(col_count, len(row))
-    out_headers = list(headers) + [""] * (col_count - len(headers))
-    out_rows = []
-    for row in data_rows:
-        cells = list(row) + [None] * (col_count - len(row))
-        out_rows.append(cells[:col_count])
-    return out_headers, out_rows
 
 
 def send_bytes(data, filename, mimetype):
@@ -293,13 +336,32 @@ def send_bytes(data, filename, mimetype):
     )
 
 
-def build_original_file(headers, data_rows, file_ext):
-    out_headers, out_rows = aligned_rows(headers, data_rows)
+def iter_source_rows(path, file_ext):
+    if file_ext == "csv":
+        with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as fh:
+            reader = csv.reader(fh)
+            next(reader, None)
+            for row in reader:
+                yield copy_row(row)
+        return
+
+    wb = load_workbook(path, read_only=True, data_only=True)
+    try:
+        ws = wb.active
+        rows = ws.iter_rows(values_only=True)
+        next(rows, None)
+        for row in rows:
+            yield copy_row(row)
+    finally:
+        wb.close()
+
+
+def build_original_file_from_rows(headers, rows_iter, file_ext):
     if file_ext == "csv":
         text = io.StringIO()
         writer = csv.writer(text, lineterminator="\n")
-        writer.writerow(out_headers)
-        for row in out_rows:
+        writer.writerow(headers)
+        for row in rows_iter:
             writer.writerow([csv_cell(c) for c in row])
         return (
             text.getvalue().encode("utf-8-sig"),
@@ -307,11 +369,10 @@ def build_original_file(headers, data_rows, file_ext):
             "text/csv",
         )
 
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Emails"
-    ws.append(out_headers)
-    for row in out_rows:
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Emails")
+    ws.append(list(headers))
+    for row in rows_iter:
         ws.append(row)
     output = io.BytesIO()
     wb.save(output)
@@ -325,35 +386,34 @@ def build_original_file(headers, data_rows, file_ext):
 def export_valid_file(job):
     """Download only VALID rows, keeping the original uploaded file columns."""
     headers = list(job.get("headers") or [])
-    source_rows = list(job.get("source_rows") or [])
     ordered = list(job.get("ordered") or [])
     file_ext = job.get("file_ext") or "xlsx"
+    source_path = job.get("source_path")
     valid_count = job.get("counts", {}).get("VALID", 0)
 
     if not headers:
         return jsonify({"error": "Original columns were not saved. Please upload the file and run verification again."}), 400
-
-    valid_rows = []
-    for idx, result in enumerate(ordered):
-        if not result or result.get("status") != "VALID":
-            continue
-        if idx < len(source_rows):
-            valid_rows.append(source_rows[idx])
-        else:
-            valid_rows.append([result.get("email", "")])
-
-    if not valid_rows:
+    if not source_path or not os.path.exists(source_path):
+        return jsonify({"error": "Original file is no longer available. Please upload and verify again."}), 400
+    if valid_count < 1:
         return jsonify({"error": f"No valid emails to download ({valid_count} valid)."}), 400
 
-    data, filename, mimetype = build_original_file(headers, valid_rows, file_ext)
+    def valid_rows():
+        for idx, row in enumerate(iter_source_rows(source_path, file_ext)):
+            result = ordered[idx] if idx < len(ordered) else None
+            if result and result.get("status") == "VALID":
+                yield row
+
+    data, filename, mimetype = build_original_file_from_rows(headers, valid_rows(), file_ext)
+    if not data or (file_ext == "csv" and data.decode("utf-8-sig").count("\n") <= 1):
+        return jsonify({"error": f"No valid emails to download ({valid_count} valid)."}), 400
     return send_bytes(data, filename, mimetype)
 
 
 def export_all_file(job):
-    rows = [r for r in (job.get("ordered") or job["results"]) if r]
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Verified Emails"
+    rows = [r for r in (job.get("ordered") or []) if r]
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Verified Emails")
     ws.append(["Email", "Status", "Reason"])
     for item in rows:
         ws.append([item["email"], item["status"], item["reason"]])
@@ -378,9 +438,8 @@ def export(job_id, kind=None):
             return jsonify({"error": "Verification is not completed"}), 400
         snapshot = {
             "headers": list(job.get("headers") or []),
-            "source_rows": list(job.get("source_rows") or []),
             "ordered": list(job.get("ordered") or []),
-            "results": list(job.get("results") or []),
+            "source_path": job.get("source_path"),
             "file_ext": job.get("file_ext") or "xlsx",
             "counts": dict(job.get("counts") or {}),
         }
