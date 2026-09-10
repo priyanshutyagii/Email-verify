@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MailVerify — Bulk Email Verification</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="container">
+    <header class="header">
+      <div class="brand"><span class="brand-mark">✉</span><div><h1>MailVerify</h1><p>Bulk email verification</p></div></div>
+      <span class="badge">XLSX / CSV</span>
+    </header>
+
+    <section class="card upload-card">
+      <h2>Upload your email list</h2>
+      <p class="muted">Your Excel file should contain a column named <b>Email</b>.</p>
+
+      <label class="dropzone" id="dropzone">
+        <input id="fileInput" type="file" accept=".xlsx,.csv">
+        <div class="upload-icon">↑</div>
+        <strong id="fileTitle">Drop Excel/CSV here or click to browse</strong>
+        <span id="fileSub">Supports XLSX and CSV</span>
+      </label>
+
+      <div class="options">
+        <label class="check">
+          <input type="checkbox" id="smtpCheck" checked>
+          <span>Enable best-effort SMTP mailbox check</span>
+        </label>
+      </div>
+
+      <button class="primary" id="startBtn" disabled>Start verification</button>
+    </section>
+
+    <section class="stats">
+      <div class="stat"><span>Total</span><b id="total">0</b></div>
+      <div class="stat valid"><span>Valid</span><b id="valid">0</b></div>
+      <div class="stat invalid"><span>Invalid</span><b id="invalid">0</b></div>
+      <div class="stat risky"><span>Risky</span><b id="risky">0</b></div>
+      <div class="stat unknown"><span>Unknown</span><b id="unknown">0</b></div>
+    </section>
+
+    <section class="card progress-card">
+      <div class="progress-head"><strong id="progressText">Ready</strong><span id="percent">0%</span></div>
+      <div class="progress"><div id="bar"></div></div>
+      <div class="actions">
+        <button class="secondary" id="exportBtn" type="button" disabled>Download verified Excel</button>
+        <button class="secondary valid-export" id="exportValidBtn" type="button" disabled>Download valid emails only</button>
+      </div>
+    </section>
+
+    <section class="card results-card">
+      <div class="results-head">
+        <div><h2>Verification results</h2><p class="muted">Latest processed records</p></div>
+        <input id="search" class="search" placeholder="Search email...">
+      </div>
+      <div class="table-wrap">
+        
+        <table>
+          <thead><tr><th>Email</th><th>Status</th><th>Reason</th></tr></thead>
+          <tbody id="tbody"><tr><td colspan="3" class="empty">No verification started yet.</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <p class="note">SMTP checks are best-effort. Some providers hide mailbox existence, so <b>Unknown</b> does not mean invalid.</p>
+  </main>
+  <script src="/static/script.js"></script>
+</body>
+</html>
